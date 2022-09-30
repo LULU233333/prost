@@ -328,6 +328,8 @@ impl<'a> CodeGenerator<'a> {
             Label::Optional => {
                 if optional {
                     self.buf.push_str(", optional");
+                } else if field.r#type() == Type::Message {
+                    self.buf.push_str(", required");
                 }
             }
             Label::Required => self.buf.push_str(", required"),
@@ -881,7 +883,7 @@ impl<'a> CodeGenerator<'a> {
         }
 
         match field.r#type() {
-            Type::Message => true,
+            Type::Message => false,
             _ => self.syntax == Syntax::Proto2,
         }
     }
