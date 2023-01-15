@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/prost-build/0.11.1")]
+#![doc(html_root_url = "https://docs.rs/prost-build/0.11.6")]
 #![allow(clippy::option_as_ref_deref, clippy::format_push_string)]
 
 //! `prost-build` compiles `.proto` files into Rust.
@@ -62,9 +62,14 @@
 //!
 //! ```rust,ignore
 //! // Include the `items` module, which is generated from items.proto.
-//! pub mod items {
-//!     include!(concat!(env!("OUT_DIR"), "/snazzy.items.rs"));
+//! // It is important to maintain the same structure as in the proto.
+//! pub mod snazzy {
+//!     pub mod items {
+//!         include!(concat!(env!("OUT_DIR"), "/snazzy.items.rs"));
+//!     }
 //! }
+//!
+//! use snazzy::items;
 //!
 //! pub fn create_large_shirt(color: String) -> items::Shirt {
 //!     let mut shirt = items::Shirt::default();
@@ -122,13 +127,6 @@
 //!
 //! [`protobuf-src`]: https://docs.rs/protobuf-src
 
-mod ast;
-mod code_generator;
-mod extern_paths;
-mod ident;
-mod message_graph;
-mod path;
-
 use std::collections::HashMap;
 use std::default;
 use std::env;
@@ -140,7 +138,9 @@ use std::ops::RangeToInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use log::debug;
 use log::trace;
+
 use prost::Message;
 use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
@@ -150,6 +150,13 @@ use crate::extern_paths::ExternPaths;
 use crate::ident::to_snake;
 use crate::message_graph::MessageGraph;
 use crate::path::PathMap;
+
+mod ast;
+mod code_generator;
+mod extern_paths;
+mod ident;
+mod message_graph;
+mod path;
 
 /// A service generator takes a service descriptor and generates Rust code.
 ///
@@ -237,6 +244,8 @@ pub struct Config {
     map_type: PathMap<MapType>,
     bytes_type: PathMap<BytesType>,
     type_attributes: PathMap<String>,
+    message_attributes: PathMap<String>,
+    enum_attributes: PathMap<String>,
     field_attributes: PathMap<String>,
     prost_types: bool,
     strip_enum_prefix: bool,
@@ -247,6 +256,8 @@ pub struct Config {
     disable_comments: PathMap<()>,
     skip_protoc_run: bool,
     include_file: Option<PathBuf>,
+    prost_path: Option<String>,
+    fmt: bool,
 }
 
 impl Config {
@@ -459,6 +470,94 @@ impl Config {
         self
     }
 
+    /// Add additional attribute to matched messages.
+    ///
+    /// # Arguments
+    ///
+    /// **`paths`** - a path matching any number of types. It works the same way as in
+    /// [`btree_map`](#method.btree_map), just with the field name omitted.
+    ///
+    /// **`attribute`** - an arbitrary string to be placed before each matched type. The
+    /// expected usage are additional attributes, but anything is allowed.
+    ///
+    /// The calls to this method are cumulative. They don't overwrite previous calls and if a
+    /// type is matched by multiple calls of the method, all relevant attributes are added to
+    /// it.
+    ///
+    /// For things like serde it might be needed to combine with [field
+    /// attributes](#method.field_attribute).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// // Nothing around uses floats, so we can derive real `Eq` in addition to `PartialEq`.
+    /// config.message_attribute(".", "#[derive(Eq)]");
+    /// // Some messages want to be serializable with serde as well.
+    /// config.message_attribute("my_messages.MyMessageType",
+    ///                       "#[derive(Serialize)] #[serde(rename_all = \"snake_case\")]");
+    /// config.message_attribute("my_messages.MyMessageType.MyNestedMessageType",
+    ///                       "#[derive(Serialize)] #[serde(rename_all = \"snake_case\")]");
+    /// ```
+    pub fn message_attribute<P, A>(&mut self, path: P, attribute: A) -> &mut Self
+    where
+        P: AsRef<str>,
+        A: AsRef<str>,
+    {
+        self.message_attributes
+            .insert(path.as_ref().to_string(), attribute.as_ref().to_string());
+        self
+    }
+
+    /// Add additional attribute to matched enums and one-ofs.
+    ///
+    /// # Arguments
+    ///
+    /// **`paths`** - a path matching any number of types. It works the same way as in
+    /// [`btree_map`](#method.btree_map), just with the field name omitted.
+    ///
+    /// **`attribute`** - an arbitrary string to be placed before each matched type. The
+    /// expected usage are additional attributes, but anything is allowed.
+    ///
+    /// The calls to this method are cumulative. They don't overwrite previous calls and if a
+    /// type is matched by multiple calls of the method, all relevant attributes are added to
+    /// it.
+    ///
+    /// For things like serde it might be needed to combine with [field
+    /// attributes](#method.field_attribute).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// // Nothing around uses floats, so we can derive real `Eq` in addition to `PartialEq`.
+    /// config.enum_attribute(".", "#[derive(Eq)]");
+    /// // Some messages want to be serializable with serde as well.
+    /// config.enum_attribute("my_messages.MyEnumType",
+    ///                       "#[derive(Serialize)] #[serde(rename_all = \"snake_case\")]");
+    /// config.enum_attribute("my_messages.MyMessageType.MyNestedEnumType",
+    ///                       "#[derive(Serialize)] #[serde(rename_all = \"snake_case\")]");
+    /// ```
+    ///
+    /// # Oneof fields
+    ///
+    /// The `oneof` fields don't have a type name of their own inside Protobuf. Therefore, the
+    /// field name can be used both with `enum_attribute` and `field_attribute` ‒ the first is
+    /// placed before the `enum` type definition, the other before the field inside corresponding
+    /// message `struct`.
+    ///
+    /// In other words, to place an attribute on the `enum` implementing the `oneof`, the match
+    /// would look like `my_messages.MyNestedMessageType.oneofname`.
+    pub fn enum_attribute<P, A>(&mut self, path: P, attribute: A) -> &mut Self
+    where
+        P: AsRef<str>,
+        A: AsRef<str>,
+    {
+        self.enum_attributes
+            .insert(path.as_ref().to_string(), attribute.as_ref().to_string());
+        self
+    }
+
     /// Configures the code generator to use the provided service generator.
     pub fn service_generator(&mut self, service_generator: Box<dyn ServiceGenerator>) -> &mut Self {
         self.service_generator = Some(service_generator);
@@ -481,10 +580,13 @@ impl Config {
     /// disable doctests for the crate with a [Cargo.toml entry][2]. If neither of these options
     /// are possible, then omit comments on generated code during doctest builds:
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # fn main() -> std::io::Result<()> {
     /// let mut config = prost_build::Config::new();
-    /// config.disable_comments(".");
+    /// config.disable_comments(&["."]);
     /// config.compile_protos(&["src/frontend.proto", "src/backend.proto"], &["src"])?;
+    /// #     Ok(())
+    /// # }
     /// ```
     ///
     /// As with other options which take a set of paths, comments can be disabled on a per-package
@@ -652,8 +754,7 @@ impl Config {
 
     /// In combination with with `file_descriptor_set_path`, this can be used to provide a file
     /// descriptor set as an input file, rather than having prost-build generate the file by calling
-    /// protoc.  Prost-build does require that the descriptor set was generated with
-    /// --include_source_info.
+    /// protoc.
     ///
     /// In `build.rs`:
     ///
@@ -698,6 +799,17 @@ impl Config {
         S: Into<String>,
     {
         self.default_package_filename = filename.into();
+        self
+    }
+
+    /// Configures the path that's used for deriving `Message` for generated messages.
+    /// This is mainly useful for generating crates that wish to re-export prost.
+    /// Defaults to `::prost::Message` if not specified.
+    pub fn prost_path<S>(&mut self, path: S) -> &mut Self
+    where
+        S: Into<String>,
+    {
+        self.prost_path = Some(path.into());
         self
     }
 
@@ -753,6 +865,15 @@ impl Config {
         P: Into<PathBuf>,
     {
         self.include_file = Some(path.into());
+        self
+    }
+
+    /// Configures the code generator to format the output code via `prettyplease`.
+    ///
+    /// By default, this is enabled but if the `format` feature is not enabled this does
+    /// nothing.
+    pub fn format(&mut self, enabled: bool) -> &mut Self {
+        self.fmt = enabled;
         self
     }
 
@@ -826,7 +947,7 @@ impl Config {
                 if include.as_ref().exists() {
                     cmd.arg("-I").arg(include.as_ref());
                 } else {
-                    println!(
+                    debug!(
                         "ignoring {} since it does not exist.",
                         include.as_ref().display()
                     )
@@ -847,14 +968,14 @@ impl Config {
                 cmd.arg(proto.as_ref());
             }
 
-            println!("Running: {:?}", cmd);
+            debug!("Running: {:?}", cmd);
 
             let output = cmd.output().map_err(|error| {
-            Error::new(
-                error.kind(),
-                format!("failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): (path: {:?}): {}", &protoc, error),
-            )
-        })?;
+                Error::new(
+                    error.kind(),
+                    format!("failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): (path: {:?}): {}", &protoc, error),
+                )
+            })?;
 
             if !output.status.success() {
                 return Err(Error::new(
@@ -1018,14 +1139,19 @@ impl Config {
         let extern_paths = ExternPaths::new(&self.extern_paths, self.prost_types)
             .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
 
-        for request in requests {
+        for (request_module, request_fd) in requests {
             // Only record packages that have services
-            if !request.1.service.is_empty() {
-                packages.insert(request.0.clone(), request.1.package().to_string());
+            if !request_fd.service.is_empty() {
+                packages.insert(request_module.clone(), request_fd.package().to_string());
             }
-
-            let buf = modules.entry(request.0).or_insert_with(String::new);
-            CodeGenerator::generate(self, &message_graph, &extern_paths, request.1, buf);
+            let buf = modules
+                .entry(request_module.clone())
+                .or_insert_with(String::new);
+            CodeGenerator::generate(self, &message_graph, &extern_paths, request_fd, buf);
+            if buf.is_empty() {
+                // Did not generate any code, remove from list to avoid inclusion in include file or output file list
+                modules.remove(&request_module);
+            }
         }
 
         if let Some(ref mut service_generator) = self.service_generator {
@@ -1035,8 +1161,24 @@ impl Config {
             }
         }
 
+        if self.fmt {
+            self.fmt_modules(&mut modules);
+        }
+
         Ok(modules)
     }
+
+    #[cfg(feature = "format")]
+    fn fmt_modules(&mut self, modules: &mut HashMap<Module, String>) {
+        for buf in modules.values_mut() {
+            let file = syn::parse_file(buf).unwrap();
+            let formatted = prettyplease::unparse(&file);
+            *buf = formatted;
+        }
+    }
+
+    #[cfg(not(feature = "format"))]
+    fn fmt_modules(&mut self, _: &mut HashMap<Module, String>) {}
 }
 
 impl default::Default for Config {
@@ -1047,6 +1189,8 @@ impl default::Default for Config {
             map_type: PathMap::default(),
             bytes_type: PathMap::default(),
             type_attributes: PathMap::default(),
+            message_attributes: PathMap::default(),
+            enum_attributes: PathMap::default(),
             field_attributes: PathMap::default(),
             prost_types: true,
             strip_enum_prefix: true,
@@ -1057,6 +1201,8 @@ impl default::Default for Config {
             disable_comments: PathMap::default(),
             skip_protoc_run: false,
             include_file: None,
+            prost_path: None,
+            fmt: true,
         }
     }
 }
@@ -1077,6 +1223,7 @@ impl fmt::Debug for Config {
             .field("default_package_filename", &self.default_package_filename)
             .field("protoc_args", &self.protoc_args)
             .field("disable_comments", &self.disable_comments)
+            .field("prost_path", &self.prost_path)
             .finish()
     }
 }
@@ -1217,7 +1364,7 @@ pub fn protoc_from_env() -> PathBuf {
     let os_specific_hint = if cfg!(target_os = "macos") {
         "You could try running `brew install protobuf` or downloading it from https://github.com/protocolbuffers/protobuf/releases"
     } else if cfg!(target_os = "linux") {
-        "If you're on debian, try `apt-get install protobuf3-compiler` or download it from https://github.com/protocolbuffers/protobuf/releases"
+        "If you're on debian, try `apt-get install protobuf-compiler` or download it from https://github.com/protocolbuffers/protobuf/releases"
     } else {
         "You can download it from https://github.com/protocolbuffers/protobuf/releases or from your package manager."
     };
@@ -1262,16 +1409,18 @@ pub fn protoc_include_from_env() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::RefCell;
     use std::fs::File;
     use std::io::Read;
     use std::path::Path;
     use std::rc::Rc;
 
+    use super::*;
+
     /// An example service generator that generates a trait with methods corresponding to the
     /// service methods.
     struct ServiceTraitGenerator;
+
     impl ServiceGenerator for ServiceTraitGenerator {
         fn generate(&mut self, service: Service, buf: &mut String) {
             // Generate a trait for the service.
@@ -1282,7 +1431,7 @@ mod tests {
             for method in service.methods {
                 method.comments.append_with_indent(1, buf);
                 buf.push_str(&format!(
-                    "    fn {}({}) -> {};\n",
+                    "    fn {}(_: {}) -> {};\n",
                     method.name, method.input_type, method.output_type
                 ));
             }
@@ -1369,6 +1518,86 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_message_attributes() {
+        let _ = env_logger::try_init();
+
+        let out_dir = std::env::temp_dir();
+
+        Config::new()
+            .out_dir(out_dir.clone())
+            .message_attribute(".", "#[derive(derive_builder::Builder)]")
+            .enum_attribute(".", "#[some_enum_attr(u8)]")
+            .compile_protos(
+                &["src/fixtures/helloworld/hello.proto"],
+                &["src/fixtures/helloworld"],
+            )
+            .unwrap();
+
+        let out_file = out_dir
+            .join("helloworld.rs")
+            .as_path()
+            .display()
+            .to_string();
+        let expected_content = read_all_content("src/fixtures/helloworld/_expected_helloworld.rs")
+            .replace("\r\n", "\n");
+        let content = read_all_content(&out_file).replace("\r\n", "\n");
+        assert_eq!(
+            expected_content, content,
+            "Unexpected content: \n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_generate_no_empty_outputs() {
+        let _ = env_logger::try_init();
+        let state = Rc::new(RefCell::new(MockState::default()));
+        let gen = MockServiceGenerator::new(Rc::clone(&state));
+        let include_file = "_include.rs";
+        let out_dir = std::env::temp_dir()
+            .as_path()
+            .join("test_generate_no_empty_outputs");
+        let previously_empty_proto_path = out_dir.as_path().join(Path::new("google.protobuf.rs"));
+        // For reproducibility, ensure we start with the out directory created and empty
+        let _ = fs::remove_dir_all(&out_dir);
+        let _ = fs::create_dir(&out_dir);
+
+        Config::new()
+            .service_generator(Box::new(gen))
+            .include_file(include_file)
+            .out_dir(&out_dir)
+            .compile_protos(
+                &["src/fixtures/imports_empty/imports_empty.proto"],
+                &["src/fixtures/imports_empty"],
+            )
+            .unwrap();
+
+        // Prior to PR introducing this test, the generated include file would have the file
+        // google.protobuf.rs which was an empty file. Now that file should only exist if it has content
+        if let Ok(mut f) = File::open(&previously_empty_proto_path) {
+            // Since this file was generated, it should not be empty.
+            let mut contents = String::new();
+            f.read_to_string(&mut contents).unwrap();
+            assert!(!contents.is_empty());
+        } else {
+            // The file wasn't generated so the result include file should not reference it
+            let expected = read_all_content("src/fixtures/imports_empty/_expected_include.rs");
+            let actual = read_all_content(
+                out_dir
+                    .as_path()
+                    .join(Path::new(include_file))
+                    .display()
+                    .to_string()
+                    .as_str(),
+            );
+            // Normalizes windows and Linux-style EOL
+            let expected = expected.replace("\r\n", "\n");
+            let actual = actual.replace("\r\n", "\n");
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[test]
     fn deterministic_include_file() {
         let _ = env_logger::try_init();
 
@@ -1416,6 +1645,6 @@ mod tests {
         let mut f = File::open(filepath).unwrap();
         let mut content = String::new();
         f.read_to_string(&mut content).unwrap();
-        return content;
+        content
     }
 }

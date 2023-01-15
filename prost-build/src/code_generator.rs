@@ -29,7 +29,7 @@ enum Syntax {
 pub struct CodeGenerator<'a> {
     config: &'a mut Config,
     package: String,
-    source_info: SourceCodeInfo,
+    source_info: Option<SourceCodeInfo>,
     syntax: Syntax,
     message_graph: &'a MessageGraph,
     extern_paths: &'a ExternPaths,
@@ -51,16 +51,14 @@ impl<'a> CodeGenerator<'a> {
         file: FileDescriptorProto,
         buf: &mut String,
     ) {
-        let mut source_info = file
-            .source_code_info
-            .expect("no source code info in request");
-        source_info.location.retain(|location| {
-            let len = location.path.len();
-            len > 0 && len % 2 == 0
+        let source_info = file.source_code_info.map(|mut s| {
+            s.location.retain(|loc| {
+                let len = loc.path.len();
+                len > 0 && len % 2 == 0
+            });
+            s.location.sort_by(|a, b| a.path.cmp(&b.path));
+            s
         });
-        source_info
-            .location
-            .sort_by_key(|location| location.path.clone());
 
         let syntax = match file.syntax.as_ref().map(String::as_str) {
             None | Some("proto2") => Syntax::Proto2,
@@ -182,9 +180,14 @@ impl<'a> CodeGenerator<'a> {
 
         self.append_doc(&fq_message_name, None);
         self.append_type_attributes(&fq_message_name);
+        self.append_message_attributes(&fq_message_name);
         self.push_indent();
         self.buf
-            .push_str("#[derive(Clone, PartialEq, ::prost::Message)]\n");
+            .push_str("#[allow(clippy::derive_partial_eq_without_eq)]\n");
+        self.buf.push_str(&format!(
+            "#[derive(Clone, PartialEq, {}::Message)]\n",
+            self.config.prost_path.as_deref().unwrap_or("::prost")
+        ));
         self.push_indent();
         self.buf.push_str("pub struct ");
         self.buf.push_str(&to_upper_camel(&message_name));
@@ -262,6 +265,24 @@ impl<'a> CodeGenerator<'a> {
     fn append_type_attributes(&mut self, fq_message_name: &str) {
         assert_eq!(b'.', fq_message_name.as_bytes()[0]);
         for attribute in self.config.type_attributes.get(fq_message_name) {
+            push_indent(self.buf, self.depth);
+            self.buf.push_str(attribute);
+            self.buf.push('\n');
+        }
+    }
+
+    fn append_message_attributes(&mut self, fq_message_name: &str) {
+        assert_eq!(b'.', fq_message_name.as_bytes()[0]);
+        for attribute in self.config.message_attributes.get(fq_message_name) {
+            push_indent(self.buf, self.depth);
+            self.buf.push_str(attribute);
+            self.buf.push('\n');
+        }
+    }
+
+    fn append_enum_attributes(&mut self, fq_message_name: &str) {
+        assert_eq!(b'.', fq_message_name.as_bytes()[0]);
+        for attribute in self.config.enum_attributes.get(fq_message_name) {
             push_indent(self.buf, self.depth);
             self.buf.push_str(attribute);
             self.buf.push('\n');
@@ -388,13 +409,18 @@ impl<'a> CodeGenerator<'a> {
         self.buf.push_str("pub ");
         self.buf.push_str(&to_snake(field.name()));
         self.buf.push_str(": ");
+
+        let prost_path = self.config.prost_path.as_deref().unwrap_or("::prost");
+
         if repeated {
-            self.buf.push_str("::prost::alloc::vec::Vec<");
+            self.buf
+                .push_str(&format!("{}::alloc::vec::Vec<", prost_path));
         } else if optional {
             self.buf.push_str("::core::option::Option<");
         }
         if boxed {
-            self.buf.push_str("::prost::alloc::boxed::Box<");
+            self.buf
+                .push_str(&format!("{}::alloc::boxed::Box<", prost_path));
         }
         self.buf.push_str(&ty);
         if boxed {
@@ -499,9 +525,14 @@ impl<'a> CodeGenerator<'a> {
 
         let oneof_name = format!("{}.{}", fq_message_name, oneof.name());
         self.append_type_attributes(&oneof_name);
+        self.append_enum_attributes(&oneof_name);
         self.push_indent();
         self.buf
-            .push_str("#[derive(Clone, PartialEq, ::prost::Oneof)]\n");
+            .push_str("#[allow(clippy::derive_partial_eq_without_eq)]\n");
+        self.buf.push_str(&format!(
+            "#[derive(Clone, PartialEq, {}::Oneof)]\n",
+            self.config.prost_path.as_deref().unwrap_or("::prost")
+        ));
         self.push_indent();
         self.buf.push_str("pub enum ");
         self.buf.push_str(&to_upper_camel(oneof.name()));
@@ -558,14 +589,13 @@ impl<'a> CodeGenerator<'a> {
         self.buf.push_str("}\n");
     }
 
-    fn location(&self) -> &Location {
-        let idx = self
-            .source_info
+    fn location(&self) -> Option<&Location> {
+        let source_info = self.source_info.as_ref()?;
+        let idx = source_info
             .location
             .binary_search_by_key(&&self.path[..], |location| &location.path[..])
             .unwrap();
-
-        &self.source_info.location[idx]
+        Some(&source_info.location[idx])
     }
 
     fn append_doc(&mut self, fq_name: &str, field_name: Option<&str>) {
@@ -578,7 +608,9 @@ impl<'a> CodeGenerator<'a> {
             self.config.disable_comments.get(fq_name).next().is_none()
         };
         if append_doc {
-            Comments::from_location(self.location()).append_with_indent(self.depth, self.buf)
+            if let Some(comments) = self.location().map(Comments::from_location) {
+                comments.append_with_indent(self.depth, self.buf);
+            }
         }
     }
 
@@ -605,9 +637,10 @@ impl<'a> CodeGenerator<'a> {
 
         self.append_doc(&fq_proto_enum_name, None);
         self.append_type_attributes(&fq_proto_enum_name);
+        self.append_enum_attributes(&fq_proto_enum_name);
         self.push_indent();
         self.buf.push_str(
-            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]\n",
+            &format!("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, {}::Enumeration)]\n",self.config.prost_path.as_deref().unwrap_or("::prost")),
         );
         self.push_indent();
         self.buf.push_str("#[repr(i32)]\n");
@@ -689,6 +722,38 @@ impl<'a> CodeGenerator<'a> {
         self.push_indent();
         self.buf.push_str("}\n"); // End of as_str_name()
 
+        self.push_indent();
+        self.buf
+            .push_str("/// Creates an enum from field names used in the ProtoBuf definition.\n");
+
+        self.push_indent();
+        self.buf
+            .push_str("pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {\n");
+        self.depth += 1;
+
+        self.push_indent();
+        self.buf.push_str("match value {\n");
+        self.depth += 1;
+
+        for variant in variant_mappings.iter() {
+            self.push_indent();
+            self.buf.push('\"');
+            self.buf.push_str(variant.proto_name);
+            self.buf.push_str("\" => Some(Self::");
+            self.buf.push_str(&variant.generated_variant_name);
+            self.buf.push_str("),\n");
+        }
+        self.push_indent();
+        self.buf.push_str("_ => None,\n");
+
+        self.depth -= 1;
+        self.push_indent();
+        self.buf.push_str("}\n"); // End of match
+
+        self.depth -= 1;
+        self.push_indent();
+        self.buf.push_str("}\n"); // End of from_str_name()
+
         self.path.pop();
         self.depth -= 1;
         self.push_indent();
@@ -699,7 +764,10 @@ impl<'a> CodeGenerator<'a> {
         let name = service.name().to_owned();
         debug!("  service: {:?}", name);
 
-        let comments = Comments::from_location(self.location());
+        let comments = self
+            .location()
+            .map(Comments::from_location)
+            .unwrap_or_default();
 
         self.path.push(2);
         let methods = service
@@ -708,8 +776,12 @@ impl<'a> CodeGenerator<'a> {
             .enumerate()
             .map(|(idx, mut method)| {
                 debug!("  method: {:?}", method.name());
+
                 self.path.push(idx as i32);
-                let comments = Comments::from_location(self.location());
+                let comments = self
+                    .location()
+                    .map(Comments::from_location)
+                    .unwrap_or_default();
                 self.path.pop();
 
                 let name = method.name.take().unwrap();
@@ -782,6 +854,8 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn resolve_type(&self, field: &FieldDescriptorProto, fq_message_name: &str) -> String {
+        let prost_path = self.config.prost_path.as_deref().unwrap_or("::prost");
+
         match field.r#type() {
             Type::Float => String::from("f32"),
             Type::Double => String::from("f64"),
@@ -790,7 +864,7 @@ impl<'a> CodeGenerator<'a> {
             Type::Int32 | Type::Sfixed32 | Type::Sint32 | Type::Enum => String::from("i32"),
             Type::Int64 | Type::Sfixed64 | Type::Sint64 => String::from("i64"),
             Type::Bool => String::from("bool"),
-            Type::String => String::from("::prost::alloc::string::String"),
+            Type::String => format!("{}::alloc::string::String", prost_path),
             Type::Bytes => self
                 .config
                 .bytes_type
@@ -985,11 +1059,11 @@ fn unescape_c_escape_string(s: &str) -> Vec<u8> {
                     p += 1;
                 }
                 b'0'..=b'7' => {
-                    eprintln!("another octal: {}, offset: {}", s, &s[p..]);
+                    debug!("another octal: {}, offset: {}", s, &s[p..]);
                     let mut octal = 0;
                     for _ in 0..3 {
                         if p < len && src[p] >= b'0' && src[p] <= b'7' {
-                            eprintln!("\toctal: {}", octal);
+                            debug!("\toctal: {}", octal);
                             octal = octal * 8 + (src[p] - b'0');
                             p += 1;
                         } else {
